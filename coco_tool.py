@@ -37,32 +37,66 @@ def shoelace_area(polygon_flat):
 
 def detect_shape_type(polygon_flat, tolerance):
     n = len(polygon_flat) // 2
-    if n != 4:
+    if n < 3:
         return 'polygon'
 
-    xs = [float(polygon_flat[2 * i]) for i in range(4)]
-    ys = [float(polygon_flat[2 * i + 1]) for i in range(4)]
+    points = [
+        (float(polygon_flat[2 * i]), float(polygon_flat[2 * i + 1]))
+        for i in range(n)
+    ]
 
-    unique_xs = []
-    for x in xs:
-        if not any(abs(x - ux) <= tolerance for ux in unique_xs):
-            unique_xs.append(x)
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
 
-    unique_ys = []
-    for y in ys:
-        if not any(abs(y - uy) <= tolerance for uy in unique_ys):
-            unique_ys.append(y)
+    x_min = min(xs)
+    x_max = max(xs)
+    y_min = min(ys)
+    y_max = max(ys)
 
-    if len(unique_xs) == 2 and len(unique_ys) == 2:
+    rect_area = (x_max - x_min) * (y_max - y_min)
+    poly_area = shoelace_area(polygon_flat)
+
+    if rect_area <= 0:
+        return 'polygon'
+
+    # Her nokta dikdörtgenin sınır çizgilerinden birinin üzerinde mi?
+    points_on_boundary = True
+    for x, y in points:
+        on_left = abs(x - x_min) <= tolerance
+        on_right = abs(x - x_max) <= tolerance
+        on_top = abs(y - y_min) <= tolerance
+        on_bottom = abs(y - y_max) <= tolerance
+
+        if not (on_left or on_right or on_top or on_bottom):
+            points_on_boundary = False
+            break
+
+    # Polygon alanı ile bbox alanı birbirine yakın mı?
+    area_close = abs(poly_area - rect_area) <= tolerance * max(x_max - x_min, y_max - y_min)
+
+    if points_on_boundary and area_close:
         return 'rectangle'
-    return 'polygon'
 
+    return 'polygon'
 
 def detect_annotation_shape(segmentation, tolerance):
     if not segmentation:
         return 'polygon'
-    return detect_shape_type(segmentation[0], tolerance)
 
+    all_points = []
+
+    for polygon in segmentation:
+        n = len(polygon) // 2
+        for i in range(n):
+            all_points.extend([
+                float(polygon[2 * i]),
+                float(polygon[2 * i + 1])
+            ])
+
+    if not all_points:
+        return 'polygon'
+
+    return detect_shape_type(all_points, tolerance)
 
 def polygon_to_rectangle(segmentation):
     all_xs = []
@@ -114,28 +148,44 @@ def validate_annotation(ann):
     return []
 
 
+def iter_json_items(input_path, prefix):
+    """COCO JSON içindeki büyük listeleri belleğe almadan tek tek döndürür."""
+    with open(input_path, 'rb') as f:
+        yield from ijson.items(f, prefix, use_float=True)
+
+
+def read_optional_object(input_path, prefix):
+    """info gibi küçük üst seviye objeleri okur; yoksa None döndürür."""
+    with open(input_path, 'rb') as f:
+        for obj in ijson.items(f, prefix, use_float=True):
+            return obj
+    return None
+
+
+def write_json_array_item(out_f, item, first_item):
+    if not first_item:
+        out_f.write(',')
+    json.dump(item, out_f, ensure_ascii=False, separators=(',', ':'))
+    return False
+
+
 def process_file(input_path, output_path, sigma=DEFAULT_SIGMA, verbose=True):
     input_path = Path(input_path)
     if not input_path.exists():
         print(f"HATA: Dosya bulunamadı → {input_path}")
         return None
 
-    with open(input_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+    output_path = Path(output_path)
+    if input_path.resolve() == output_path.resolve() or (
+        output_path.exists() and input_path.samefile(output_path)
+    ):
+        raise ValueError("Girdi ve çıktı aynı dosya olamaz; farklı bir çıktı yolu seçin.")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     images_dict = {}
-    if 'images' in data:
-        for img in data['images']:
-            images_dict[img['id']] = {
-                'width': int(img.get('width', 0)),
-                'height': int(img.get('height', 0)),
-            }
-
     categories = {}
-    if 'categories' in data:
-        for cat in data['categories']:
-            categories[cat['id']] = cat.get('name', f"id_{cat['id']}")
 
+    total_images = 0
     total = 0
     valid = 0
     invalid = 0
@@ -150,14 +200,62 @@ def process_file(input_path, output_path, sigma=DEFAULT_SIGMA, verbose=True):
     converted = 0
     skipped = 0
 
-    if 'annotations' in data:
-        for ann in data['annotations']:
+    info = read_optional_object(input_path, 'info')
+
+    with open(output_path, 'w', encoding='utf-8') as out_f:
+        out_f.write('{')
+        first_top_level = True
+
+        if info is not None:
+            out_f.write('"info":')
+            json.dump(info, out_f, ensure_ascii=False, separators=(',', ':'))
+            first_top_level = False
+
+        # licenses genellikle küçüktür ama yine de item item kopyalanır.
+        if not first_top_level:
+            out_f.write(',')
+        out_f.write('"licenses":[')
+        first_item = True
+        for license_item in iter_json_items(input_path, 'licenses.item'):
+            first_item = write_json_array_item(out_f, license_item, first_item)
+        out_f.write(']')
+        first_top_level = False
+
+        # images listesini belleğe almadan çıktıya yazar; sadece id->boyut sözlüğünü tutar.
+        out_f.write(',"images":[')
+        first_item = True
+        for img in iter_json_items(input_path, 'images.item'):
+            total_images += 1
+            img_id = img.get('id')
+            if img_id is not None:
+                images_dict[img_id] = {
+                    'width': int(img.get('width', 0)),
+                    'height': int(img.get('height', 0)),
+                }
+            first_item = write_json_array_item(out_f, img, first_item)
+        out_f.write(']')
+
+        # categories listesini çıktıya yazar ve rapor için id->name sözlüğünü tutar.
+        out_f.write(',"categories":[')
+        first_item = True
+        for cat in iter_json_items(input_path, 'categories.item'):
+            cat_id = cat.get('id')
+            if cat_id is not None:
+                categories[cat_id] = cat.get('name', f"id_{cat_id}")
+            first_item = write_json_array_item(out_f, cat, first_item)
+        out_f.write(']')
+
+        # Büyük kısım: annotations. Her annotation tek tek okunur, dönüştürülür ve anında yazılır.
+        out_f.write(',"annotations":[')
+        first_item = True
+        for ann in iter_json_items(input_path, 'annotations.item'):
             total += 1
 
             errs = validate_annotation(ann)
             if errs:
                 invalid += 1
                 skipped += 1
+                first_item = write_json_array_item(out_f, ann, first_item)
                 continue
 
             valid += 1
@@ -184,6 +282,7 @@ def process_file(input_path, output_path, sigma=DEFAULT_SIGMA, verbose=True):
             result = polygon_to_rectangle(ann['segmentation'])
             if result is None:
                 skipped += 1
+                first_item = write_json_array_item(out_f, ann, first_item)
                 continue
 
             new_segmentation, new_bbox, new_area = result
@@ -192,10 +291,10 @@ def process_file(input_path, output_path, sigma=DEFAULT_SIGMA, verbose=True):
             ann['area'] = new_area
             converted += 1
 
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+            first_item = write_json_array_item(out_f, ann, first_item)
+
+        out_f.write(']')
+        out_f.write('}')
 
     if verbose:
         folder_name = input_path.parent.name if input_path.parent.name else str(input_path.parent)
@@ -204,7 +303,7 @@ def process_file(input_path, output_path, sigma=DEFAULT_SIGMA, verbose=True):
         print(f"Klasör : {folder_name}")
         print(f"Dosya  : {input_path.name} ({file_size_mb:.2f} MB)")
         print()
-        print(f"Görüntü sayısı     : {len(images_dict)}")
+        print(f"Görüntü sayısı     : {total_images}")
         print(f"Etiketli görüntü   : {len(annotated_image_ids)}")
         print(f"Toplam annotation  : {total}  (geçerli: {valid}, hatalı: {invalid})")
 
@@ -227,11 +326,12 @@ def process_file(input_path, output_path, sigma=DEFAULT_SIGMA, verbose=True):
             print(f"\nAlan (piksel kare) : ort {avg_area:.0f}, min {min_area:.0f}, max {max_area:.0f}")
 
         print(f"\nDönüşüm            : {converted} annotation min/max ile dikdörtgene düzenlendi")
+        print(f"Atlanan            : {skipped} annotation dönüştürülmeden korundu")
         print(f"Çıktı dosyası      : {output_path}")
 
     return {
         'file': input_path.name,
-        'total_images': len(images_dict),
+        'total_images': total_images,
         'annotated_images': len(annotated_image_ids),
         'total_anns': total,
         'valid_anns': valid,
@@ -241,6 +341,7 @@ def process_file(input_path, output_path, sigma=DEFAULT_SIGMA, verbose=True):
         'rectangle_count': shape_counts_before['rectangle'],
         'polygon_count': shape_counts_before['polygon'],
         'converted': converted,
+        'skipped': skipped,
         'total_area': total_area,
         'min_area': min_area if min_area is not None else 0.0,
         'max_area': max_area,
@@ -290,6 +391,7 @@ def run(path_str, output_dir=None, suffix='_rectangles', sigma=DEFAULT_SIGMA):
     total_rect = sum(s['rectangle_count'] for s in summaries)
     total_poly = sum(s['polygon_count'] for s in summaries)
     total_converted = sum(s['converted'] for s in summaries)
+    total_skipped = sum(s['skipped'] for s in summaries)
 
     all_categories = set()
     for s in summaries:
@@ -313,7 +415,7 @@ def run(path_str, output_dir=None, suffix='_rectangles', sigma=DEFAULT_SIGMA):
     n_shape_total = total_rect + total_poly
     if n_shape_total > 0:
         print(f"Şekil dağılımı     : {total_rect} dikdörtgen ({100*total_rect/n_shape_total:.1f}%), "
-            f"{total_poly} polygon ({100*total_poly/n_shape_total:.1f}%)")
+              f"{total_poly} polygon ({100*total_poly/n_shape_total:.1f}%)")
 
     print(f"Farklı kategori    : {len(all_categories)}")
     if all_categories:
@@ -323,20 +425,21 @@ def run(path_str, output_dir=None, suffix='_rectangles', sigma=DEFAULT_SIGMA):
         print(f"Alan (piksel kare) : ort {overall_avg:.0f}, min {overall_min:.0f}, max {overall_max:.0f}")
 
     print(f"Dönüşüm            : {total_converted} annotation min/max ile dikdörtgene düzenlendi")
+    print(f"Atlanan            : {total_skipped} annotation dönüştürülmeden korundu")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="COCO format annotation aracı: analiz eder ve tüm annotation'ları "
-                    "x/y min-max değerlerine göre dikdörtgene düzenler."
+        description="COCO format annotation aracı: büyük JSON dosyalarını ijson ile parça parça okur, "
+                    "annotation'ları x/y min-max değerlerine göre dikdörtgene düzenler."
     )
     parser.add_argument('path',
                         help="JSON dosyasının yolu VEYA içinde JSON olan bir klasör")
     parser.add_argument('--sigma', type=float, default=DEFAULT_SIGMA,
                         help=f"Şekil tespiti için görüntü boyutuna oranlı tolerans katsayısı "
-                            f"(varsayılan: {DEFAULT_SIGMA}). "
+                             f"(varsayılan: {DEFAULT_SIGMA}). "
                              f"tolerance = max(width,height) * sigma. "
-                            f"Minimum {MIN_TOLERANCE} piksel garantilidir.")
+                             f"Minimum {MIN_TOLERANCE} piksel garantilidir.")
     parser.add_argument('--output', default=None,
                         help="Çıktı klasörü (varsayılan: girdi yanına _rectangles ek ile)")
     parser.add_argument('--suffix', default='_rectangles',

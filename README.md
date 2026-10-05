@@ -1,14 +1,14 @@
 # COCO Annotation Tool
 
-COCO formatındaki etiketli veri kümeleri için doğrulama, analiz ve dikdörtgene dönüştürme aracı. Python ile yazıldı, sağlık alanı segmentasyon verileri başta olmak üzere COCO formatına uyan her veri kümesinde çalışır.
+Staj çalışmamda COCO JSON dosyalarını kontrol etmek ve polygon anotasyonlarını dikdörtgene dönüştürmek için hazırladığım Python aracı.
 
 ## Özellikler
 
-- JSON dosyasını streaming olarak okur (büyük dosyalarda RAM şişmez)
-- Annotation doğruluk kontrolleri (eksik alan, geçersiz polygon, negatif koordinat)
+- Büyük JSON listelerini `ijson` ile kayıt kayıt okur ve çıktıyı aynı şekilde yazar. Görüntü kimlikleri ve boyutları ile kategori bilgileri bellekte tutulur.
+- Eksik zorunlu alan, polygon formatı ve nokta sayısı kontrolleri
 - Polygon alan hesabı (Shoelace formülü)
 - Şekil tespiti: dikdörtgen ve polygon ayrımı
-- Tüm annotation'ları x ve y'nin min-max değerlerine göre dikdörtgene düzenleme
+- Geçerli polygon anotasyonlarını x ve y'nin min-max değerlerine göre dikdörtgene düzenleme
 - Görüntü boyutuna oranlı dinamik tolerans (sigma parametresi)
 - Tek dosya veya klasör bazlı toplu işlem
 - Klasör modunda toplam özet (gereksiz detay yok)
@@ -23,7 +23,7 @@ pip install ijson
 
 ## Kullanım
 
-Tek komut çalıştırıyorsunuz, hem analiz raporu çıkıyor hem de tüm annotation'lar otomatik olarak min-max değerlerine göre dikdörtgene dönüştürülerek yeni bir dosyaya kaydediliyor. Orijinal dosya bozulmuyor.
+Tek komutla analiz özeti ve dönüştürülmüş JSON dosyası oluşturulur. Girdi dosyası değiştirilmez; girdi ile aynı dosyaya çıktı yazılması engellenir. RLE ve yapısal kontrolden geçmeyen anotasyonlar dönüştürülmeden korunur ve atlanan sayısına eklenir.
 
 **Tek dosya:**
 ```bash
@@ -40,12 +40,19 @@ python coco_tool.py klasor_adi
 python coco_tool.py annotations.json --sigma 0.002
 ```
 
+**Çıktı klasörü belirterek:**
+```bash
+python coco_tool.py annotations.json --output sonuclar
+```
+
 **Yardım menüsü:**
 ```bash
 python coco_tool.py --help
 ```
 
 ## Çıktı Örneği
+
+Aşağıdaki sayılar çıktı biçimini göstermek için örnektir.
 
 **Tek dosya:**
 ```
@@ -66,6 +73,7 @@ Kategoriler (4):
 Alan (piksel kare) : ort 7653, min 218, max 35712
 
 Dönüşüm            : 225 annotation min/max ile dikdörtgene düzenlendi
+Atlanan            : 0 annotation dönüştürülmeden korundu
 Çıktı dosyası      : annotations_rectangles.json
 ```
 
@@ -83,6 +91,7 @@ Farklı kategori    : 6
   calcification, cyst, healthy_tissue, lesion, necrotic_core, tumor
 Alan (piksel kare) : ort 8923, min 218, max 490000
 Dönüşüm            : 684 annotation min/max ile dikdörtgene düzenlendi
+Atlanan            : 1 annotation dönüştürülmeden korundu
 ```
 
 ## Dönüştürme Mantığı
@@ -100,7 +109,7 @@ Algoritma her tür nokta sayısı için çalışır — 3, 5, 100 nokta fark etm
 Şekil tespiti için kullanılan tolerans, görüntü boyutuna oranlı olarak hesaplanır:
 
 ```
-tolerance = max(image_width, image_height) * sigma
+tolerance = max(0.5, max(image_width, image_height) * sigma)
 ```
 
 Varsayılan `sigma = 0.001` — yani görüntünün büyük kenarının binde biri kadar tolerans:
@@ -121,6 +130,8 @@ Her annotation için yapılan kontroller:
 - Polygon formatı geçerli mi
 - En az 3 nokta var mı
 - Segmentation tipi polygon mı (RLE atlanır)
+
+Bu kontroller tam bir COCO şema doğrulaması değildir. Negatif koordinat, görüntü sınırı, kimliklerin tekilliği ve `image_id` / `category_id` ilişkileri ayrıca denetlenmez. Çıktıya standart `info`, `licenses`, `images`, `categories` ve `annotations` alanları aktarılır; özel üst seviye alanlar aktarılmaz.
 
 ## Bağımlılıklar
 
